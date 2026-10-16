@@ -1,7 +1,7 @@
-
 import logging
 from contextlib import asynccontextmanager
-from uuid import UUID
+from uuid import UUID, uuid4
+
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy import select, text
@@ -10,20 +10,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import engine, get_db
 from app.models import Event
-from app.schemas import EventCreate, EventResponse
+from app.schemas import EventCreate, EventResponse, EventAccepted
+
+from app.kafka import publish_event, start_kafka_producer, stop_kafka_producer
+
+from aiokafka.errors import KafkaError
+
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("scalehub.ingestion")
+logger = logging.getLogger("dislog.ingestion")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await engine.dispose()
+    await start_kafka_producer()
+
+    try:
+        yield
+    finally:
+        await stop_kafka_producer()
+        await engine.dispose()
 
 
 app = FastAPI(
-    title="ScaleHub Ingestion API",
+    title="DisLog Ingestion API",
     version="0.2.0",
     lifespan=lifespan,
 )
@@ -31,7 +41,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "scalehub-ingestion"}
+    return {"status": "ok", "service": "dislog-ingestion"}
 
 
 @app.get("/ready")
@@ -47,41 +57,40 @@ async def ready(db: AsyncSession = Depends(get_db)):
         ) from exc
 
 
-@app.post("/v1/events", response_model=EventResponse, status_code=201)
+@app.post("/v1/events", response_model=EventAccepted, status_code=202)
 async def create_event(
     event: EventCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
 ):
     request_id = request.headers.get("x-request-id", "unknown")
 
-    db_event = Event(
-        service=event.service,
-        level=event.level,
-        message=event.message,
-        attributes=event.attributes,
-    )
+    event_id = uuid4()
+
+    payload = {
+        "id" : str(event_id),
+        **event.model_dump(),
+    }
 
     try:
-        db.add(db_event)
-        await db.commit()
-        await db.refresh(db_event)
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        logger.exception("Event persistence failed request_id=%s", request_id)
+        await publish_event(payload)
+    except Exception as exc:
+        logger.exception(
+            "Event publication failed request_id = %s",
+            request_id
+        )
         raise HTTPException(
             status_code=503,
-            detail="Could not persist event",
+            detail = "Event ingestion temporarily not available",
         ) from exc
-
+    
     logger.info(
-        "event_persisted request_id=%s event_id=%s service=%s",
+        "event_accepted request_id=%s event_id=%s service=%s",
         request_id,
-        db_event.id,
-        db_event.service,
+        event_id,
+        event.service,
     )
 
-    return db_event
+    return EventAccepted(id=event_id, status="accepted")
 
 
 @app.get("/v1/events/{event_id}", response_model=EventResponse)

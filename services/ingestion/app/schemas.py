@@ -22,3 +22,7 @@ class EventResponse(BaseModel):
     message: str
     attributes: dict[str, Any]
     created_at: datetime
+
+class EventAccepted(BaseModel):
+    id: UUID
+    status: str = "accepted"
