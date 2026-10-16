@@ -1,75 +1,100 @@
 
 import logging
-from datetime import datetime, timezone
-from typing import Any
-from uuid import UUID, uuid4
+from contextlib import asynccontextmanager
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Request
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+from app.database import engine, get_db
+from app.models import Event
+from app.schemas import EventCreate, EventResponse
 
-logger = logging.getLogger("DisLog.ingestion")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("scalehub.ingestion")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await engine.dispose()
+
 
 app = FastAPI(
-    title="DisLog Ingestion API",
-    version="0.1.0",
+    title="ScaleHub Ingestion API",
+    version="0.2.0",
+    lifespan=lifespan,
 )
-
-
-class EventCreate(BaseModel):
-    service: str = Field(min_length=1, max_length=100)
-    level: str = Field(min_length=1, max_length=20)
-    message: str = Field(min_length=1, max_length=5000)
-    attributes: dict[str, Any] = Field(default_factory=dict)
-
-
-class EventResponse(BaseModel):
-    id: UUID
-    service: str
-    level: str
-    message: str
-    attributes: dict[str, Any]
-    created_at: datetime
 
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "service": "scalehub-ingestion",
-    }
+    return {"status": "ok", "service": "scalehub-ingestion"}
 
 
-@app.post(
-    "/v1/events",
-    response_model=EventResponse,
-    status_code=status.HTTP_201_CREATED,
-)
+@app.get("/ready")
+async def ready(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "connected"}
+    except SQLAlchemyError as exc:
+        logger.warning("Database readiness check failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable",
+        ) from exc
+
+
+@app.post("/v1/events", response_model=EventResponse, status_code=201)
 async def create_event(
     event: EventCreate,
     request: Request,
+    db: AsyncSession = Depends(get_db),
 ):
     request_id = request.headers.get("x-request-id", "unknown")
 
-    result = EventResponse(
-        id=uuid4(),
+    db_event = Event(
         service=event.service,
         level=event.level,
         message=event.message,
         attributes=event.attributes,
-        created_at=datetime.now(timezone.utc),
     )
+
+    try:
+        db.add(db_event)
+        await db.commit()
+        await db.refresh(db_event)
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.exception("Event persistence failed request_id=%s", request_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not persist event",
+        ) from exc
 
     logger.info(
-        "event_accepted request_id=%s event_id=%s service=%s level=%s",
+        "event_persisted request_id=%s event_id=%s service=%s",
         request_id,
-        result.id,
-        result.service,
-        result.level,
+        db_event.id,
+        db_event.service,
     )
 
-    return result
+    return db_event
+
+
+@app.get("/v1/events/{event_id}", response_model=EventResponse)
+async def get_event(
+    event_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Event).where(Event.id == event_id)
+    )
+    event = result.scalar_one_or_none()
+
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return event
