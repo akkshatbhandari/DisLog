@@ -4,7 +4,7 @@ import logging
 import os
 from uuid import UUID
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import SessionLocal, engine
@@ -19,8 +19,16 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "localhost:9092",
 )
 
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "dislog-events")
+KAFKA_TOPIC = os.getenv(
+    "KAFKA_TOPIC", 
+    "dislog-events"
+)
 KAFKA_GROUP_ID = "dislog-persistence-v1"
+
+DEAD_LETTER_TOPIC = os.getenv(
+    "KAFKA_DEAD_LETTER_TOPIC",
+    "dislog-events-dlq",
+)
 
 MAX_DB_RETRIES = 5
 INITIAL_RETRY_DELAY = 1.0
@@ -109,6 +117,49 @@ async def process_event(payload: dict) -> None:
             await asyncio.sleep(delay)
 
 
+async def process_record(record, consumer, dead_letter_producer) -> None:
+    """Persist valid events or route malformed events to the DLQ."""
+    try:
+        payload = deserialize_event(record.value)   
+        await process_event(payload)
+    except ValueError as exc:
+        #Preserve malformed messages for later inspection.
+        dead_letter_payload = {
+            "source_topic" : record.topic,
+            "source_partition": record.partition,
+            "source_offset": record.offset,
+            "error": str(exc),
+            "raw_value": (
+                record.value.decode("utf-8", errors = "replace")
+                if record.value is not None
+                else None
+            ),
+        }
+
+        await dead_letter_producer.send_and_wait(
+            DEAD_LETTER_TOPIC,
+            json.dumps(dead_letter_payload).encode("utf-8"),
+        )
+        await consumer.commit()
+
+        logger.warning(
+            "event_sent_to_dlq topic=%s partition=%s offset=%s",
+            record.topic,
+            record.partition,
+            record.offset,
+        )
+        return
+    
+    await consumer.commit()
+
+    logger.info(
+        "event_persisted event_id=%s partition=%s offset=%s",
+        payload["id"],
+        record.partition,
+        record.offset,
+    )
+
+
 async def run_worker() -> None:
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
@@ -123,25 +174,26 @@ async def run_worker() -> None:
         value_deserializer = None,
     )
 
+    dead_letter_producer = AIOKafkaProducer(
+        bootstrap_servers = KAFKA_BOOTSTRAP_SERVERS,
+        acks = "all"
+    )
+
+    await dead_letter_producer.start()
+
     await consumer.start()
     logger.info("DisLog persistence worker started topic = %s",KAFKA_TOPIC)
 
     try:
         async for record in consumer:
             try:
-                payload = deserialize_event(record.value)
-                await process_event(payload)
-
+                await process_record(record, consumer, dead_letter_producer)
             except ValueError:
-                # Do not commit or silently discard malformed events.
-                # Stop so an operator can inspect and recover the record.
-
                 logger.exception(
-                    "invalid_event_payload partition=%s offset = %s",
+                    "invalid_event_payload partition=%s offset=%s",
                     record.partition,
                     record.offset,
                 )
-
                 raise
 
             await consumer.commit()
@@ -154,6 +206,7 @@ async def run_worker() -> None:
             )
     finally:
         await consumer.stop()
+        await dead_letter_producer.stop()
         await engine.dispose()
         logger.info("dislog_persistence_worker_stopped")
 
