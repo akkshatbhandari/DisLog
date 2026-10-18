@@ -840,3 +840,37 @@ async def test_database_failure_does_not_commit_kafka_offset():
     assert item.completed is False
     assert item.topic_partition in offset_tracker.pending
     assert item in offset_tracker.pending[item.topic_partition]
+
+
+@pytest.mark.asyncio
+async def test_redelivered_event_uses_duplicate_safe_insert():
+    payload = valid_payload()
+    session = make_mock_session()
+
+    with patch.object(
+        worker,
+        "SessionLocal",
+        return_value=session,
+    ):
+        # First delivery persists the event.
+        await worker.process_event(payload)
+
+        # Simulate redelivery after the worker crashes before
+        # acknowledging the Kafka offset.
+        await worker.process_event(payload)
+
+    assert session.execute.await_count == 2
+    assert session.commit.await_count == 2
+
+    for call in session.execute.await_args_list:
+        statement = call.args[0]
+        compiled_sql = str(
+            statement.compile(
+                dialect=__import__(
+                    "sqlalchemy.dialects.postgresql",
+                    fromlist=["dialect"],
+                ).dialect()
+            )
+        )
+        assert "ON CONFLICT" in compiled_sql
+        assert "DO NOTHING" in compiled_sql
