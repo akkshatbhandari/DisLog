@@ -4,39 +4,123 @@ import logging
 import os
 from uuid import UUID
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from aiokafka.structs import OffsetAndMetadata
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import SessionLocal, engine
 from app.models import Event
 
+from typing import Any
+from collections import defaultdict
+from dataclasses import dataclass, field
+
 
 logging.basicConfig(level = logging.INFO)
 logger = logging.getLogger("dislog.worker")
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv(
-    "KAFKA_BOOTSTRAP_SERVERS",
-    "localhost:9092",
+from app.config import (
+    KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_TOPIC,
+    KAFKA_DEAD_LETTER_TOPIC,
+    KAFKA_GROUP_ID,
+    WORKER_COUNT,
+    QUEUE_MAX_SIZE,
+    DB_MAX_RETRIES,
+    DB_INITIAL_RETRY_DELAY,
+    DB_MAX_RETRY_DELAY,
+    KAFKA_COMMIT_MAX_RETRIES,
+    KAFKA_COMMIT_RETRY_DELAY,
 )
 
-KAFKA_TOPIC = os.getenv(
-    "KAFKA_TOPIC", 
-    "dislog-events"
-)
-KAFKA_GROUP_ID = "dislog-persistence-v1"
+@dataclass
+class PendingRecord:
+    """Track one kafka record until processing complete"""
 
-DEAD_LETTER_TOPIC = os.getenv(
-    "KAFKA_DEAD_LETTER_TOPIC",
-    "dislog-events-dlq",
-)
+    topic_partition: TopicPartition
+    offset: int
+    payload: Any
+    completed: bool = False
+    topic: str = KAFKA_TOPIC
 
-MAX_DB_RETRIES = 5
-INITIAL_RETRY_DELAY = 1.0
-MAX_RETRY_DELAY = 16.0
+class OffsetTracker:
+    """Commit only offsets whose earlier dispatched records have completed."""
+
+    def __init__(self, consumer):
+        self.consumer = consumer
+        self.pending = defaultdict(list)
+        self.lock = asyncio.Lock()
+
+    def register(self, item: PendingRecord) -> None:
+        """Register a record before placing it on the worker queue."""
+        self.pending[item.topic_partition].append(item)
+
+    async def mark_completed(self, item: PendingRecord) -> None:
+        """Commit the contiguous completed prefix for this partition."""
+
+        async with self.lock:
+            item.completed = True
+            records = self.pending[item.topic_partition]
+
+            completed_count = 0
+            for record in records:
+                if not record.completed:
+                    break
+                completed_count += 1
+            
+            if completed_count == 0:
+                return
+            
+            last_record = records[completed_count - 1]
+            next_offset = last_record.offset + 1
+
+            commit_offsets = {
+                item.topic_partition: OffsetAndMetadata(next_offset, "")
+            }
+
+            for attempt in range(KAFKA_COMMIT_MAX_RETRIES):
+                try:
+                    await self.consumer.commit(commit_offsets)
+                    break
+                except Exception:
+                    if attempt == KAFKA_COMMIT_MAX_RETRIES - 1:
+                        logger.exception(
+                            "kafka_offset_commit_failed "
+                            "partition=%s next_offset=%s attempts=%s",
+                            item.topic_partition.partition,
+                            next_offset,
+                            KAFKA_COMMIT_MAX_RETRIES,
+                        )
+                        raise
+                    
+                    delay = KAFKA_COMMIT_RETRY_DELAY * (2 ** attempt)
+
+                    logger.warning(
+                        "kafka_offset_commit_retry "
+                        "partition=%s next_offset=%s attempt=%s delay_seconds=%s",
+                        item.topic_partition.partition,
+                        next_offset,
+                        attempt + 1,
+                        delay,
+                    )
+                    
+                    await asyncio.sleep(delay)
+
+            del records[:completed_count]
+
+            if not records:
+                del self.pending[item.topic_partition]
+
+
+def create_work_queue() -> asyncio.Queue:
+    """Create a bounded queue using centralized configuration"""
+    return asyncio.Queue(maxsize = QUEUE_MAX_SIZE)
 
 def deserialize_event(value: bytes) -> dict:
     """Decode JSON without allowing malformed payloads to crash deserialization"""
-
+    if value is None:
+        raise ValueError("Kafka message has no value")
+    
     try:
         payload = json.loads(value.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -89,24 +173,24 @@ async def process_event(payload: dict) -> None:
         .on_conflict_do_nothing(index_elements=[Event.id])
     )
 
-    for attempt in range(MAX_DB_RETRIES):
+    for attempt in range(DB_MAX_RETRIES):
         try:
             async with SessionLocal() as session:
                 await session.execute(statement)
                 await session.commit()
             return
         except Exception:
-            if attempt == MAX_DB_RETRIES - 1:
+            if attempt == DB_MAX_RETRIES - 1:
                 logger.exception(
                     "event_persistence_failed event_id=%s attempts=%s",
                     event_id,
-                    MAX_DB_RETRIES,
+                    DB_MAX_RETRIES,
                 )
                 raise
 
             delay = min(
-                INITIAL_RETRY_DELAY * (2 ** attempt),
-                MAX_RETRY_DELAY,
+                DB_INITIAL_RETRY_DELAY * (2 ** attempt),
+                DB_MAX_RETRY_DELAY,
             )
             logger.warning(
                 "event_persistence_retry event_id=%s attempt=%s delay_seconds=%s",
@@ -117,48 +201,247 @@ async def process_event(payload: dict) -> None:
             await asyncio.sleep(delay)
 
 
-async def process_record(record, consumer, dead_letter_producer) -> None:
-    """Persist valid events or route malformed events to the DLQ."""
-    try:
-        payload = deserialize_event(record.value)   
-        await process_event(payload)
-    except ValueError as exc:
-        #Preserve malformed messages for later inspection.
-        dead_letter_payload = {
-            "source_topic" : record.topic,
-            "source_partition": record.partition,
-            "source_offset": record.offset,
-            "error": str(exc),
-            "raw_value": (
-                record.value.decode("utf-8", errors = "replace")
-                if record.value is not None
-                else None
-            ),
-        }
+# async def process_record(record, consumer, dead_letter_producer) -> None:
+#     """Persist valid events or route malformed events to the DLQ."""
+#     try:
+#         payload = deserialize_event(record.value)   
+#         await process_event(payload)
+#     except ValueError as exc:
+#         #Preserve malformed messages for later inspection.
+#         dead_letter_payload = {
+#             "source_topic" : record.topic,
+#             "source_partition": record.partition,
+#             "source_offset": record.offset,
+#             "error": str(exc),
+#             "raw_value": (
+#                 record.value.decode("utf-8", errors = "replace")
+#                 if record.value is not None
+#                 else None
+#             ),
+#         }
 
-        await dead_letter_producer.send_and_wait(
-            DEAD_LETTER_TOPIC,
-            json.dumps(dead_letter_payload).encode("utf-8"),
-        )
-        await consumer.commit()
+#         await dead_letter_producer.send_and_wait(
+#             KAFKA_DEAD_LETTER_TOPIC,
+#             json.dumps(dead_letter_payload).encode("utf-8"),
+#         )
+#         await consumer.commit()
 
-        logger.warning(
-            "event_sent_to_dlq topic=%s partition=%s offset=%s",
-            record.topic,
-            record.partition,
-            record.offset,
-        )
-        return
+#         logger.warning(
+#             "event_sent_to_dlq topic=%s partition=%s offset=%s",
+#             record.topic,
+#             record.partition,
+#             record.offset,
+#         )
+#         return
     
-    await consumer.commit()
+#     await consumer.commit()
 
-    logger.info(
-        "event_persisted event_id=%s partition=%s offset=%s",
-        payload["id"],
-        record.partition,
-        record.offset,
-    )
+#     logger.info(
+#         "event_persisted event_id=%s partition=%s offset=%s",
+#         payload["id"],
+#         record.partition,
+#         record.offset,
+#     )
 
+async def persistence_worker(
+    queue: asyncio.Queue,
+    worker_id: int,
+    dead_letter_producer = None,
+    offset_tracker: OffsetTracker | None = None,
+) -> None:
+    """Persist valid events or route invalid messages to the DLQ."""
+
+    logger.info("persistence worker started worker_id=%s", worker_id)
+
+    while True:
+        item = await queue.get()
+
+        try:
+            if item is None:
+                return
+            
+            try:
+                if isinstance(item.payload, bytes) or item.payload is None:
+                    payload = deserialize_event(item.payload)
+                elif isinstance(item.payload, dict):
+                    payload = item.payload
+                else:
+                    raise ValueError("unsupported event payload type")
+                
+                validate_event(payload)
+            
+            except ValueError as exc:
+                if dead_letter_producer is None:
+                    raise RuntimeError(
+                        "DLQ producer is required for invalid records"
+                    ) from exc
+
+                raw_val = item.payload
+
+                if isinstance(raw_val, bytes):
+                    raw_val = raw_val.decode(
+                        "utf-8",
+                        errors = "replace",
+                    )
+                elif raw_val is not None and not isinstance(raw_val, str):
+                    raw_val = json.dumps(raw_val, default = str)
+                
+                dead_letter_payload = {
+                    "source_topic": item.topic,
+                    "source_partition": item.topic_partition.partition,
+                    "source_offset": item.offset,
+                    "error": str(exc),
+                    "raw_val": raw_val,
+                }
+
+                await dead_letter_producer.send_and_wait(
+                    KAFKA_DEAD_LETTER_TOPIC,
+                    json.dumps(dead_letter_payload).encode("utf-8"),
+                )
+
+                logger.warning(
+                    "event_sent_to_dlq worker_id=%s partition=%s offset=%s",
+                    worker_id,
+                    item.topic_partition.partition,
+                    item.offset,
+                )
+            else:
+                await process_event(payload)
+
+                logger.info(
+                    "event_persisted worker_id=%s partition=%s offset=%s",
+                    worker_id,
+                    item.topic_partition.partition,
+                    item.offset,
+                )
+            
+            if offset_tracker is not None:
+                await offset_tracker.mark_completed(item)
+            else:
+                item.completed = True
+        
+        except Exception:
+            logger.exception(
+                "event_processing_failed worker_id=%s partition=%s offset=%s",
+                worker_id,
+                item.topic_partition.partition,
+                item.offset,
+            )
+
+            raise
+        finally:
+            queue.task_done()
+
+
+async def supervise_workers(
+    queue: asyncio.Queue,
+    dead_letter_producer,
+    offset_tracker: OffsetTracker,
+    shutdown_event: asyncio.Event | None = None,
+) -> None:
+    """Monitor workers and support coordinated graceful shutdown."""
+    
+    if shutdown_event is None:
+        shutdown_event = asyncio.Event()
+
+    tasks = [
+        asyncio.create_task(
+            persistence_worker(
+                queue, 
+                worker_id = index+1,
+                dead_letter_producer = dead_letter_producer,
+                offset_tracker = offset_tracker,
+                ),
+            name = f"dislog-persistence-worker-{index+1}",
+        )
+        for index in range(WORKER_COUNT)
+    ]
+
+    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+
+    try:
+        done, _ = await asyncio.wait(
+            [*tasks, shutdown_waiter],
+            return_when = asyncio.FIRST_COMPLETED,
+        )
+        
+        # Worker failures take precedence over a shutdown request.
+        for task in tasks:
+            if task.done():
+                if task.cancelled():
+                    raise RuntimeError(
+                        f"Persistence worker was cancelled: {task.get_name()}"
+                    )
+
+                exception = task.exception()
+                if exception is not None:
+                    raise exception
+                
+                raise RuntimeError(
+                    f"Persistence worker exited unexpectedly: {task.get_name()}"
+                )
+        
+        if shutdown_waiter not in done:
+            raise RuntimeError("Worker pool stopped unexpectedly")
+        
+        # Wait for queued and in-flight work to finish, while still
+        # monitoring workers so a crashed worker cannot hang shutdown.
+        join_task = asyncio.create_task(queue.join())
+
+        try:
+            done, _ = await asyncio.wait(
+                [*tasks, join_task],
+                return_when = asyncio.FIRST_COMPLETED,
+            )
+
+            for task in tasks:
+                if task.done():
+                    if task.cancelled():
+                        raise RuntimeError(
+                            f"Persistence worker was cancelled: {task.get_name()}"
+                        )
+                    
+                    exception = task.exception()
+
+                    if exception is not None:
+                        raise exception
+                    
+                    raise RuntimeError(
+                        f"Persistence worker exited unexpectedly: {task.get_name()}"
+                    )
+
+            if join_task not in done:
+                raise RuntimeError("Worker exited before the queue drained")
+            
+
+            for _ in tasks:
+                await queue.put(None)
+            
+            results = await asyncio.gather(
+                *tasks,
+                return_exceptions = True,
+            )
+
+            for task,result in zip(tasks, results):
+                if isinstance(result, BaseException):
+                    raise RuntimeError(
+                        f"Worker failed during shutdown: {task.get_name()}"
+                    ) from result
+        
+        finally:
+            if not join_task.done():
+                join_task.cancel()
+                await asyncio.gather(join_task, return_exceptions=True)
+
+    finally:
+        shutdown_waiter.cancel()
+        await asyncio.gather(shutdown_waiter, return_exceptions=True)
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 async def run_worker() -> None:
     consumer = AIOKafkaConsumer(
@@ -179,36 +462,62 @@ async def run_worker() -> None:
         acks = "all"
     )
 
-    await dead_letter_producer.start()
+    queue = create_work_queue()
+    offset_tracker = OffsetTracker(consumer)
 
-    await consumer.start()
-    logger.info("DisLog persistence worker started topic = %s",KAFKA_TOPIC)
+    worker_supervisor = None
 
     try:
+        await dead_letter_producer.start()
+        await consumer.start()
+
+        logger.info(
+            "DisLog persistence worker started topic=%s workers=%s",
+            KAFKA_TOPIC,
+            WORKER_COUNT,
+        )
+
+        worker_supervisor = asyncio.create_task(
+            supervise_workers(
+                queue,
+                dead_letter_producer,
+                offset_tracker,
+            ),
+            name = "dislog-worker-supervisor",
+        )
+
         async for record in consumer:
-            try:
-                await process_record(record, consumer, dead_letter_producer)
-            except ValueError:
-                logger.exception(
-                    "invalid_event_payload partition=%s offset=%s",
+            # Fail promptly if a persistence worker has crashed.
+            if worker_supervisor.done():
+                await worker_supervisor
+            
+            item = PendingRecord(
+                topic_partition = TopicPartition(
+                    record.topic,
                     record.partition,
-                    record.offset,
-                )
-                raise
-
-            await consumer.commit()
-
-            logger.info(
-                "event_persisted event_id = %s partition = %s offset = %s",
-                payload["id"],
-                record.partition,
-                record.offset,
+                ),
+                offset = record.offset,
+                payload = record.value,
+                topic = record.topic,
             )
+
+            offset_tracker.register(item)
+            await queue.put(item)
+
     finally:
+        if worker_supervisor is not None:
+            if not worker_supervisor.done():
+                worker_supervisor.cancel()
+
+            await asyncio.gather(
+                worker_supervisor,
+                return_exceptions = True,
+            )
+        
         await consumer.stop()
         await dead_letter_producer.stop()
         await engine.dispose()
-        logger.info("dislog_persistence_worker_stopped")
+
 
 if __name__ == "__main__":
     asyncio.run(run_worker())
