@@ -630,3 +630,159 @@ async def test_supervisor_drains_queued_events_during_shutdown():
 
     # All records should have completed processing.
     assert all(item.completed for item in items)
+
+@pytest.mark.asyncio
+async def test_supervisor_propagates_worker_failure_during_shutdown():
+    queue = worker.create_work_queue()
+    shutdown_event = asyncio.Event()
+
+    worker_started = asyncio.Event()
+    allow_worker_failure = asyncio.Event()
+
+    dead_letter_producer = AsyncMock()
+    offset_tracker = AsyncMock()
+
+    item = worker.PendingRecord(
+        topic_partition=worker.TopicPartition("dislog-events", 0),
+        offset=250,
+        payload=valid_payload(),
+    )
+    await queue.put(item)
+
+    async def failing_worker(
+        queue,
+        worker_id,
+        dead_letter_producer=None,
+        offset_tracker=None,
+    ):
+        current_item = await queue.get()
+
+        try:
+            worker_started.set()
+
+            # Simulate a task that is still in progress during shutdown.
+            await allow_worker_failure.wait()
+
+            raise RuntimeError("worker crashed during shutdown")
+        finally:
+            queue.task_done()
+
+    with patch.object(
+        worker,
+        "persistence_worker",
+        new=failing_worker,
+    ):
+        supervisor_task = asyncio.create_task(
+            worker.supervise_workers(
+                queue,
+                dead_letter_producer,
+                offset_tracker,
+                shutdown_event=shutdown_event,
+            )
+        )
+
+        try:
+            # Ensure the worker has taken the queued item.
+            await asyncio.wait_for(worker_started.wait(), timeout=3)
+
+            # Start graceful shutdown while the item is in progress.
+            shutdown_event.set()
+
+            # Allow the worker to fail during the queue drain.
+            allow_worker_failure.set()
+
+            with pytest.raises(
+                RuntimeError,
+                match="worker crashed during shutdown",
+            ):
+                await asyncio.wait_for(supervisor_task, timeout=5)
+
+        finally:
+            allow_worker_failure.set()
+
+            if not supervisor_task.done():
+                supervisor_task.cancel()
+
+            await asyncio.gather(
+                supervisor_task,
+                return_exceptions=True,
+            )
+
+    # The failed item must not be reported as completed.
+    assert item.completed is False
+
+    # The queue item was acknowledged to asyncio.Queue for bookkeeping,
+    # but the supervisor must still report the worker failure.
+    await asyncio.wait_for(queue.join(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reports_commit_failure_during_shutdown():
+    queue = worker.create_work_queue()
+    shutdown_event = asyncio.Event()
+
+    consumer = AsyncMock()
+    consumer.commit.side_effect = RuntimeError(
+        "Kafka commit failed permanently"
+    )
+
+    offset_tracker = worker.OffsetTracker(consumer)
+    dead_letter_producer = AsyncMock()
+
+    item = worker.PendingRecord(
+        topic_partition=worker.TopicPartition("dislog-events", 0),
+        offset=300,
+        payload=valid_payload(),
+    )
+    offset_tracker.register(item)
+    await queue.put(item)
+
+    with patch.object(
+        worker,
+        "process_event",
+        new_callable=AsyncMock,
+    ) as persist:
+        supervisor_task = asyncio.create_task(
+            worker.supervise_workers(
+                queue,
+                dead_letter_producer,
+                offset_tracker,
+                shutdown_event=shutdown_event,
+            )
+        )
+
+        try:
+            # Request shutdown while the queued event is being handled.
+            shutdown_event.set()
+
+            with patch.object(
+                worker.asyncio,
+                "sleep",
+                new_callable=AsyncMock,
+            ):
+                with pytest.raises(
+                    RuntimeError,
+                    match="Kafka commit failed permanently",
+                ):
+                    await asyncio.wait_for(
+                        supervisor_task,
+                        timeout=5,
+                    )
+        finally:
+            if not supervisor_task.done():
+                supervisor_task.cancel()
+
+            await asyncio.gather(
+                supervisor_task,
+                return_exceptions=True,
+            )
+
+    # Persistence succeeded, but offset acknowledgement did not.
+    persist.assert_awaited_once_with(item.payload)
+    assert item.completed is True
+
+    # The failed commit must retain the record for recovery.
+    assert item.topic_partition in offset_tracker.pending
+    assert item in offset_tracker.pending[item.topic_partition]
+
+    assert consumer.commit.await_count == worker.KAFKA_COMMIT_MAX_RETRIES
