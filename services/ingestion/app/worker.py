@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import signal
+
 from uuid import UUID
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
@@ -364,7 +366,7 @@ async def supervise_workers(
             [*tasks, shutdown_waiter],
             return_when = asyncio.FIRST_COMPLETED,
         )
-        
+
         # Worker failures take precedence over a shutdown request.
         for task in tasks:
             if task.done():
@@ -450,10 +452,8 @@ async def run_worker() -> None:
         group_id = KAFKA_GROUP_ID,
         enable_auto_commit = False,
         auto_offset_reset = "latest",
-
         # Deserialize inside the processing loop so malformed messages
         # can be handled explicitly instead of crashing the consumer.
-
         value_deserializer = None,
     )
 
@@ -465,58 +465,125 @@ async def run_worker() -> None:
     queue = create_work_queue()
     offset_tracker = OffsetTracker(consumer)
 
+    stop_consuming = asyncio.Event()
+    shutdown_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+    previous_signal_handlers = {}
+    consumer_started = False
+    producer_started = False
+
     worker_supervisor = None
 
+    def request_shutdown() -> None:
+        if not stop_consuming.is_set():
+            logger.info("Shutdown requested")
+
+        stop_consuming.set()
+    
+    def handle_signal(signum, frame) -> None:
+        loop.call_soon_threadsafe(request_shutdown)
+    
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_signal_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig,handle_signal)
+        except (ValueError, OSError):
+            logger.debug(
+                "Could not register handler for signal %s",
+                sig,
+            )
+    
     try:
         await dead_letter_producer.start()
-        await consumer.start()
+        producer_started = True
 
-        logger.info(
-            "DisLog persistence worker started topic=%s workers=%s",
-            KAFKA_TOPIC,
-            WORKER_COUNT,
-        )
+        await consumer.start()
+        consumer_started = True
+
+        logger.info("Kafka peristence worker started")
+
+        # logger.info(
+        #     "DisLog persistence worker started topic=%s workers=%s",
+        #     KAFKA_TOPIC,
+        #     WORKER_COUNT,
+        # )
 
         worker_supervisor = asyncio.create_task(
             supervise_workers(
                 queue,
                 dead_letter_producer,
                 offset_tracker,
+                shutdown_event = shutdown_event,
             ),
             name = "dislog-worker-supervisor",
         )
 
-        async for record in consumer:
+        while not stop_consuming.is_set():
             # Fail promptly if a persistence worker has crashed.
             if worker_supervisor.done():
                 await worker_supervisor
             
-            item = PendingRecord(
-                topic_partition = TopicPartition(
-                    record.topic,
-                    record.partition,
-                ),
-                offset = record.offset,
-                payload = record.value,
-                topic = record.topic,
+            batches = await consumer.getmany(
+                timeout_ms = 1000,
+                max_records = QUEUE_MAX_SIZE,
             )
 
-            offset_tracker.register(item)
-            await queue.put(item)
+            # A supervisor failure may have occurred while waiting for Kafka records.
+            if worker_supervisor.done():
+                await worker_supervisor
+
+            # Finish enqueueing this fetched batch before initiating supervisor shutdown. 
+            # These records remain eligible for processing and offset tracking.
+            for records in batches.values():
+                for record in records:
+                    item = PendingRecord(
+                        topic_partition = TopicPartition(
+                            record.topic,
+                            record.partition,
+                        ),
+                        offset = record.offset,
+                        payload = record.value,
+                        topic = record.topic,
+                    )
+
+                    offset_tracker.register(item)
+                    await queue.put(item)
+        
+        logger.info("Kafka consumption stopped")
 
     finally:
-        if worker_supervisor is not None:
-            if not worker_supervisor.done():
-                worker_supervisor.cancel()
-
-            await asyncio.gather(
-                worker_supervisor,
-                return_exceptions = True,
-            )
-        
-        await consumer.stop()
-        await dead_letter_producer.stop()
-        await engine.dispose()
+        # No more records will be enqueued after this point.
+        # The supervisor can now drain the queue and stop its workers.
+        shutdown_event.set()
+        try:
+            if worker_supervisor is not None:
+                await worker_supervisor
+            
+        finally:
+            try:
+                if consumer_started:
+                    await consumer.stop()
+                    logger.info("kafka consumer stopped")
+            finally:
+                try:
+                    if producer_started:
+                        await dead_letter_producer.stop()
+                        logger.info("Dead-letter producer stopped")
+                finally:
+                    try:
+                        await engine.dispose()
+                        logger.info("Database engine disposed")
+                    finally:
+                        for sig, previous_handler in (previous_signal_handlers.items()):
+                            try:
+                                signal.signal(sig, previous_handler)
+                            except(ValueError, OSError):
+                                logger.debug(
+                                    "Could not restore handler for signal %s",
+                                    sig,
+                                )
 
 
 if __name__ == "__main__":
