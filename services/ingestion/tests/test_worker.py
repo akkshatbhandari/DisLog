@@ -498,7 +498,6 @@ async def test_worker_finishes_current_item_before_shutdown():
     assert item.completed is True
     assert queue.empty()
 
-
 @pytest.mark.asyncio
 async def test_supervisor_drains_queue_before_graceful_shutdown():
     queue = worker.create_work_queue()
@@ -549,3 +548,85 @@ async def test_supervisor_drains_queue_before_graceful_shutdown():
     # Verify that shutdown left no queued or unfinished work.
     assert queue.empty()
     await asyncio.wait_for(queue.join(), timeout=1)
+
+@pytest.mark.asyncio
+async def test_supervisor_drains_queued_events_during_shutdown():
+    queue = worker.create_work_queue()
+    shutdown_event = asyncio.Event()
+
+    processing_started = asyncio.Event()
+    allow_processing_to_finish = asyncio.Event()
+    processed_events = []
+
+    # Queue 20 valid events before shutdown begins.
+    items = [
+        worker.PendingRecord(
+            topic_partition=worker.TopicPartition("dislog-events", 0),
+            offset=200 + i,
+            payload=valid_payload(),
+        )
+        for i in range(20)
+    ]
+
+    for item in items:
+        await queue.put(item)
+
+    async def slow_process(payload):
+        # Signal that a worker has started processing.
+        processing_started.set()
+
+        # Hold the workers until the test allows them to continue.
+        await allow_processing_to_finish.wait()
+
+        processed_events.append(payload["id"])
+
+    with patch.object(
+        worker,
+        "process_event",
+        new_callable=AsyncMock,
+        side_effect=slow_process,
+    ) as persist:
+        supervisor_task = asyncio.create_task(
+            worker.supervise_workers(
+                queue,
+                dead_letter_producer=None,
+                offset_tracker=None,
+                shutdown_event=shutdown_event,
+            )
+        )
+
+        try:
+            # Ensure processing is underway before requesting shutdown.
+            await asyncio.wait_for(
+                processing_started.wait(),
+                timeout=3,
+            )
+
+            shutdown_event.set()
+
+            # Let in-flight workers finish and drain the queue.
+            allow_processing_to_finish.set()
+
+            await asyncio.wait_for(
+                supervisor_task,
+                timeout=10,
+            )
+        finally:
+            # Prevent blocked test workers if an assertion or timeout fails.
+            allow_processing_to_finish.set()
+
+            if not supervisor_task.done():
+                supervisor_task.cancel()
+
+            await asyncio.gather(
+                supervisor_task,
+                return_exceptions=True,
+            )
+
+    # Every queued event should have been processed exactly once.
+    assert persist.await_count == 20
+    assert len(processed_events) == 20
+    assert queue.empty()
+
+    # All records should have completed processing.
+    assert all(item.completed for item in items)
