@@ -786,3 +786,57 @@ async def test_supervisor_reports_commit_failure_during_shutdown():
     assert item in offset_tracker.pending[item.topic_partition]
 
     assert consumer.commit.await_count == worker.KAFKA_COMMIT_MAX_RETRIES
+
+
+@pytest.mark.asyncio
+async def test_database_failure_does_not_commit_kafka_offset():
+    queue = worker.create_work_queue()
+    shutdown_event = asyncio.Event()
+
+    consumer = AsyncMock()
+    offset_tracker = worker.OffsetTracker(consumer)
+    dead_letter_producer = AsyncMock()
+
+    item = worker.PendingRecord(
+        topic_partition=worker.TopicPartition("dislog-events", 0),
+        offset=400,
+        payload=valid_payload(),
+    )
+    offset_tracker.register(item)
+    await queue.put(item)
+
+    with patch.object(
+        worker,
+        "process_event",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("database unavailable"),
+    ) as persist:
+        supervisor_task = asyncio.create_task(
+            worker.supervise_workers(
+                queue,
+                dead_letter_producer,
+                offset_tracker,
+                shutdown_event=shutdown_event,
+            )
+        )
+
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="database unavailable",
+            ):
+                await asyncio.wait_for(supervisor_task, timeout=5)
+        finally:
+            if not supervisor_task.done():
+                supervisor_task.cancel()
+
+            await asyncio.gather(
+                supervisor_task,
+                return_exceptions=True,
+            )
+
+    persist.assert_awaited_once_with(item.payload)
+    consumer.commit.assert_not_awaited()
+    assert item.completed is False
+    assert item.topic_partition in offset_tracker.pending
+    assert item in offset_tracker.pending[item.topic_partition]
