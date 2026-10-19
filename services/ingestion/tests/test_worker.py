@@ -874,3 +874,47 @@ async def test_redelivered_event_uses_duplicate_safe_insert():
         )
         assert "ON CONFLICT" in compiled_sql
         assert "DO NOTHING" in compiled_sql
+
+
+def test_create_work_queue_is_bounded():
+    queue = asyncio.Queue(maxsize=2)
+
+    assert queue.maxsize == 2
+
+    queue.put_nowait("event-1")
+    queue.put_nowait("event-2")
+
+    assert queue.full()
+    assert queue.qsize() == 2
+
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait("event-3")
+
+
+@pytest.mark.asyncio
+async def test_producer_waits_until_queue_has_capacity():
+    queue = asyncio.Queue(maxsize=1)
+
+    await queue.put("event-1")
+    assert queue.full()
+
+    producer_task = asyncio.create_task(queue.put("event-2"))
+
+    # Give the producer a chance to block on the full queue.
+    await asyncio.sleep(0.05)
+
+    assert not producer_task.done()
+    assert queue.qsize() == 1
+
+    # Simulate a worker freeing one queue slot.
+    assert await queue.get() == "event-1"
+    queue.task_done()
+
+    # The waiting producer should now be able to enqueue its event.
+    await asyncio.wait_for(producer_task, timeout=1)
+
+    assert queue.qsize() == 1
+    assert await queue.get() == "event-2"
+    queue.task_done()
+
+    await queue.join()
