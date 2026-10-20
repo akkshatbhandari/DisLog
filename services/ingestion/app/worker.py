@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import signal
+import time
 
 from uuid import UUID
 
@@ -21,6 +22,9 @@ from dataclasses import dataclass, field
 logging.basicConfig(level = logging.INFO)
 logger = logging.getLogger("dislog.worker")
 
+BATCH_SIZE = 25
+BATCH_TIMEOUT_SECONDS = 0.1
+
 from app.config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC,
@@ -34,6 +38,8 @@ from app.config import (
     KAFKA_COMMIT_MAX_RETRIES,
     KAFKA_COMMIT_RETRY_DELAY,
 )
+
+
 
 @dataclass
 class PendingRecord:
@@ -81,10 +87,21 @@ class OffsetTracker:
             }
 
             for attempt in range(KAFKA_COMMIT_MAX_RETRIES):
+                commit_started = time.perf_counter()
                 try:
                     await self.consumer.commit(commit_offsets)
+                    duration_ms = (time.perf_counter() - commit_started) * 1000
+                    logger.info(
+                        "kafka_commit_timing partition=%s next_offset=%s duration_ms=%.3f outcome=success",
+                        item.topic_partition.partition, next_offset, duration_ms,
+                    )
                     break
                 except Exception:
+                    duration_ms = (time.perf_counter() - commit_started) * 1000
+                    logger.warning(
+                        "kafka_commit_timing partition=%s next_offset=%s duration_ms=%.3f outcome=error",
+                        item.topic_partition.partition, next_offset, duration_ms,
+                    )
                     if attempt == KAFKA_COMMIT_MAX_RETRIES - 1:
                         logger.exception(
                             "kafka_offset_commit_failed "
@@ -160,7 +177,6 @@ def validate_event(payload: dict) -> UUID:
 
 async def process_event(payload: dict) -> None:
     """Persist one kafka event to postgresql idempotently"""
-
     event_id = validate_event(payload)
 
     statement = (
@@ -177,9 +193,19 @@ async def process_event(payload: dict) -> None:
 
     for attempt in range(DB_MAX_RETRIES):
         try:
+            transaction_started = time.perf_counter()
             async with SessionLocal() as session:
+                execute_started = time.perf_counter()
                 await session.execute(statement)
+                execute_ms = (time.perf_counter() - execute_started) * 1000
+                commit_started = time.perf_counter()
                 await session.commit()
+                commit_ms = (time.perf_counter() - commit_started) * 1000
+            total_ms = (time.perf_counter() - transaction_started) * 1000
+            logger.info(
+                "db_transaction_timing event_id=%s execute_ms=%.3f commit_ms=%.3f total_ms=%.3f",
+                event_id, execute_ms, commit_ms, total_ms,
+            )
             return
         except Exception:
             if attempt == DB_MAX_RETRIES - 1:
@@ -202,137 +228,224 @@ async def process_event(payload: dict) -> None:
             )
             await asyncio.sleep(delay)
 
+async def process_event_batch(payloads: list[dict]) -> None:
+    """Persist multiple events in one idempotent PostgreSQL transaction."""
+    if not payloads:
+        return
 
-# async def process_record(record, consumer, dead_letter_producer) -> None:
-#     """Persist valid events or route malformed events to the DLQ."""
-#     try:
-#         payload = deserialize_event(record.value)   
-#         await process_event(payload)
-#     except ValueError as exc:
-#         #Preserve malformed messages for later inspection.
-#         dead_letter_payload = {
-#             "source_topic" : record.topic,
-#             "source_partition": record.partition,
-#             "source_offset": record.offset,
-#             "error": str(exc),
-#             "raw_value": (
-#                 record.value.decode("utf-8", errors = "replace")
-#                 if record.value is not None
-#                 else None
-#             ),
-#         }
+    values = []
+    for payload in payloads:
+        event_id = validate_event(payload)
+        values.append({
+            "id": event_id,
+            "service": payload["service"],
+            "level": payload["level"],
+            "message": payload["message"],
+            "attributes": payload.get("attributes", {}),
+        })
 
-#         await dead_letter_producer.send_and_wait(
-#             KAFKA_DEAD_LETTER_TOPIC,
-#             json.dumps(dead_letter_payload).encode("utf-8"),
-#         )
-#         await consumer.commit()
+    statement = (
+        insert(Event)
+        .values(values)
+        .on_conflict_do_nothing(index_elements=[Event.id])
+    )
 
-#         logger.warning(
-#             "event_sent_to_dlq topic=%s partition=%s offset=%s",
-#             record.topic,
-#             record.partition,
-#             record.offset,
-#         )
-#         return
-    
-#     await consumer.commit()
-
-#     logger.info(
-#         "event_persisted event_id=%s partition=%s offset=%s",
-#         payload["id"],
-#         record.partition,
-#         record.offset,
-#     )
-
-async def persistence_worker(
-    queue: asyncio.Queue,
-    worker_id: int,
-    dead_letter_producer = None,
-    offset_tracker: OffsetTracker | None = None,
-) -> None:
-    """Persist valid events or route invalid messages to the DLQ."""
-
-    logger.info("persistence worker started worker_id=%s", worker_id)
-
-    while True:
-        item = await queue.get()
-
+    for attempt in range(DB_MAX_RETRIES):
         try:
-            if item is None:
-                return
-            
-            try:
-                if isinstance(item.payload, bytes) or item.payload is None:
-                    payload = deserialize_event(item.payload)
-                elif isinstance(item.payload, dict):
-                    payload = item.payload
-                else:
-                    raise ValueError("unsupported event payload type")
-                
-                validate_event(payload)
-            
-            except ValueError as exc:
-                if dead_letter_producer is None:
-                    raise RuntimeError(
-                        "DLQ producer is required for invalid records"
-                    ) from exc
+            transaction_started = time.perf_counter()
 
-                raw_val = item.payload
+            async with SessionLocal() as session:
+                execute_started = time.perf_counter()
+                await session.execute(statement)
+                execute_ms = (time.perf_counter() - execute_started) * 1000
 
-                if isinstance(raw_val, bytes):
-                    raw_val = raw_val.decode(
-                        "utf-8",
-                        errors = "replace",
-                    )
-                elif raw_val is not None and not isinstance(raw_val, str):
-                    raw_val = json.dumps(raw_val, default = str)
-                
-                dead_letter_payload = {
-                    "source_topic": item.topic,
-                    "source_partition": item.topic_partition.partition,
-                    "source_offset": item.offset,
-                    "error": str(exc),
-                    "raw_val": raw_val,
-                }
+                commit_started = time.perf_counter()
+                await session.commit()
+                commit_ms = (time.perf_counter() - commit_started) * 1000
 
-                await dead_letter_producer.send_and_wait(
-                    KAFKA_DEAD_LETTER_TOPIC,
-                    json.dumps(dead_letter_payload).encode("utf-8"),
-                )
+            total_ms = (time.perf_counter() - transaction_started) * 1000
+            logger.info(
+                "db_batch_timing count=%s execute_ms=%.3f "
+                "commit_ms=%.3f total_ms=%.3f",
+                len(values), execute_ms, commit_ms, total_ms,
+            )
+            return
 
-                logger.warning(
-                    "event_sent_to_dlq worker_id=%s partition=%s offset=%s",
-                    worker_id,
-                    item.topic_partition.partition,
-                    item.offset,
-                )
-            else:
-                await process_event(payload)
-
-                logger.info(
-                    "event_persisted worker_id=%s partition=%s offset=%s",
-                    worker_id,
-                    item.topic_partition.partition,
-                    item.offset,
-                )
-            
-            if offset_tracker is not None:
-                await offset_tracker.mark_completed(item)
-            else:
-                item.completed = True
-        
         except Exception:
-            logger.exception(
-                "event_processing_failed worker_id=%s partition=%s offset=%s",
+            if attempt == DB_MAX_RETRIES - 1:
+                logger.exception(
+                    "event_batch_persistence_failed count=%s attempts=%s",
+                    len(values), DB_MAX_RETRIES,
+                )
+                raise
+
+            delay = min(
+                DB_INITIAL_RETRY_DELAY * (2 ** attempt),
+                DB_MAX_RETRY_DELAY,
+            )
+            logger.warning(
+                "event_batch_persistence_retry count=%s attempt=%s "
+                "delay_seconds=%s",
+                len(values), attempt + 1, delay,
+            )
+            await asyncio.sleep(delay)
+
+
+async def _process_pending_batch(
+    items: list[PendingRecord],
+    worker_id: int,
+    dead_letter_producer,
+    offset_tracker: OffsetTracker | None,
+) -> None:
+    """Process a batch and mark records complete only after all work succeeds."""
+    valid_items: list[tuple[PendingRecord, dict]] = []
+
+    for item in items:
+        try:
+            if isinstance(item.payload, bytes) or item.payload is None:
+                payload = deserialize_event(item.payload)
+            elif isinstance(item.payload, dict):
+                payload = item.payload
+            else:
+                raise ValueError("unsupported event payload type")
+
+            validate_event(payload)
+            valid_items.append((item, payload))
+
+        except ValueError as exc:
+            if dead_letter_producer is None:
+                raise RuntimeError(
+                    "DLQ producer is required for invalid records"
+                ) from exc
+
+            raw_val = item.payload
+            if isinstance(raw_val, bytes):
+                raw_val = raw_val.decode("utf-8", errors="replace")
+            elif raw_val is not None and not isinstance(raw_val, str):
+                raw_val = json.dumps(raw_val, default=str)
+
+            dead_letter_payload = {
+                "source_topic": item.topic,
+                "source_partition": item.topic_partition.partition,
+                "source_offset": item.offset,
+                "error": str(exc),
+                "raw_val": raw_val,
+            }
+
+            await dead_letter_producer.send_and_wait(
+                KAFKA_DEAD_LETTER_TOPIC,
+                json.dumps(dead_letter_payload).encode("utf-8"),
+            )
+
+            logger.warning(
+                "event_sent_to_dlq worker_id=%s partition=%s offset=%s",
                 worker_id,
                 item.topic_partition.partition,
                 item.offset,
             )
 
+    if len(valid_items) == 1:
+        # Preserve existing single-event behavior and compatibility with tests.
+        await process_event(valid_items[0][1])
+    elif len(valid_items) > 1:
+        await process_event_batch(
+            [payload for _, payload in valid_items]
+        )
+
+    for item, payload in valid_items:
+        logger.info(
+            "event_persisted worker_id=%s partition=%s offset=%s",
+            worker_id,
+            item.topic_partition.partition,
+            item.offset,
+        )
+
+    # Do not advance any offsets until database persistence and all required
+    # DLQ sends for this batch have succeeded.
+    for item in items:
+        if offset_tracker is not None:
+            await offset_tracker.mark_completed(item)
+        else:
+            item.completed = True
+
+
+async def persistence_worker(
+    queue: asyncio.Queue,
+    worker_id: int,
+    dead_letter_producer=None,
+    offset_tracker: OffsetTracker | None = None,
+) -> None:
+    """Persist queued events in small batches or route invalid events to DLQ."""
+    batch_size = BATCH_SIZE
+    batch_timeout = BATCH_TIMEOUT_SECONDS
+
+    logger.info(
+        "persistence worker started worker_id=%s batch_size=%s",
+        worker_id,
+        batch_size,
+    )
+
+    while True:
+        first_item = await queue.get()
+        items = [first_item]
+        shutdown_seen = False
+
+        try:
+            # A sentinel received as the first item stops this worker.
+            if first_item is None:
+                return
+
+            # Collect more records until the batch is full or the timeout expires.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + batch_timeout
+
+            while len(items) < batch_size:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                
+                try:
+                    candidate = await asyncio.wait_for(
+                        queue.get(),
+                        timeout = remaining,
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+                if candidate is None:
+                    queue.task_done()
+                    shutdown_seen = True
+                    break
+
+                items.append(candidate)
+
+            # Always process the collected batch, including a partial batch.
+            await _process_pending_batch(
+                items,
+                worker_id,
+                dead_letter_producer,
+                offset_tracker,
+            )
+
+            if shutdown_seen:
+                return
+
+        except Exception:
+            failed_item = items[0]
+            logger.exception(
+                "event_processing_failed worker_id=%s partition=%s offset=%s "
+                "batch_size=%s",
+                worker_id,
+                failed_item.topic_partition.partition,
+                failed_item.offset,
+                len(items),
+            )
             raise
+
         finally:
-            queue.task_done()
+            # Each record removed from the queue is accounted for exactly once.
+            for _ in items:
+                queue.task_done()
 
 
 async def supervise_workers(

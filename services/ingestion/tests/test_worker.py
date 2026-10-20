@@ -549,6 +549,7 @@ async def test_supervisor_drains_queue_before_graceful_shutdown():
     assert queue.empty()
     await asyncio.wait_for(queue.join(), timeout=1)
 
+
 @pytest.mark.asyncio
 async def test_supervisor_drains_queued_events_during_shutdown():
     queue = worker.create_work_queue()
@@ -571,21 +572,17 @@ async def test_supervisor_drains_queued_events_during_shutdown():
     for item in items:
         await queue.put(item)
 
-    async def slow_process(payload):
-        # Signal that a worker has started processing.
+    async def slow_process_batch(payloads):
         processing_started.set()
-
-        # Hold the workers until the test allows them to continue.
         await allow_processing_to_finish.wait()
-
-        processed_events.append(payload["id"])
+        processed_events.extend(payload["id"] for payload in payloads)
 
     with patch.object(
         worker,
-        "process_event",
+        "process_event_batch",
         new_callable=AsyncMock,
-        side_effect=slow_process,
-    ) as persist:
+        side_effect=slow_process_batch,
+    ) as persist_batch:
         supervisor_task = asyncio.create_task(
             worker.supervise_workers(
                 queue,
@@ -596,15 +593,13 @@ async def test_supervisor_drains_queued_events_during_shutdown():
         )
 
         try:
-            # Ensure processing is underway before requesting shutdown.
+            # Ensure batch processing is underway before requesting shutdown.
             await asyncio.wait_for(
                 processing_started.wait(),
                 timeout=3,
             )
 
             shutdown_event.set()
-
-            # Let in-flight workers finish and drain the queue.
             allow_processing_to_finish.set()
 
             await asyncio.wait_for(
@@ -612,7 +607,6 @@ async def test_supervisor_drains_queued_events_during_shutdown():
                 timeout=10,
             )
         finally:
-            # Prevent blocked test workers if an assertion or timeout fails.
             allow_processing_to_finish.set()
 
             if not supervisor_task.done():
@@ -623,12 +617,10 @@ async def test_supervisor_drains_queued_events_during_shutdown():
                 return_exceptions=True,
             )
 
-    # Every queued event should have been processed exactly once.
-    assert persist.await_count == 20
+    # All 20 events should be handled by the batch path.
+    assert persist_batch.await_count == 1
     assert len(processed_events) == 20
     assert queue.empty()
-
-    # All records should have completed processing.
     assert all(item.completed for item in items)
 
 @pytest.mark.asyncio
@@ -918,3 +910,200 @@ async def test_producer_waits_until_queue_has_capacity():
     queue.task_done()
 
     await queue.join()
+
+
+@pytest.mark.asyncio
+async def test_process_event_batch_uses_one_duplicate_safe_transaction():
+    payloads = [valid_payload() for _ in range(3)]
+    session = make_mock_session()
+
+    with patch.object(
+        worker, "SessionLocal", return_value=session
+    ) as session_factory:
+        await worker.process_event_batch(payloads)
+
+    session_factory.assert_called_once()
+    session.execute.assert_awaited_once()
+    session.commit.assert_awaited_once()
+
+    statement = session.execute.await_args.args[0]
+    compiled_sql = str(
+        statement.compile(
+            dialect=__import__(
+                "sqlalchemy.dialects.postgresql",
+                fromlist=["dialect"],
+            ).dialect()
+        )
+    )
+
+    assert "ON CONFLICT" in compiled_sql
+    assert "DO NOTHING" in compiled_sql
+
+
+@pytest.mark.asyncio
+async def test_process_event_batch_retries_transient_database_failure():
+    payloads = [valid_payload() for _ in range(3)]
+    failed_session = make_mock_session()
+    failed_session.commit.side_effect = RuntimeError(
+        "temporary database failure"
+    )
+    successful_session = make_mock_session()
+
+    with (
+        patch.object(
+            worker,
+            "SessionLocal",
+            side_effect=[failed_session, successful_session],
+        ) as session_factory,
+        patch.object(
+            worker.asyncio, "sleep", new_callable=AsyncMock
+        ) as sleep_mock,
+    ):
+        await worker.process_event_batch(payloads)
+
+    assert session_factory.call_count == 2
+    failed_session.commit.assert_awaited_once()
+    successful_session.commit.assert_awaited_once()
+    sleep_mock.assert_awaited_once_with(
+        worker.DB_INITIAL_RETRY_DELAY
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_event_batch_raises_after_retry_exhaustion():
+    payloads = [valid_payload() for _ in range(3)]
+    failed_sessions = [
+        make_mock_session()
+        for _ in range(worker.DB_MAX_RETRIES)
+    ]
+
+    for session in failed_sessions:
+        session.commit.side_effect = RuntimeError(
+            "database unavailable"
+        )
+
+    with (
+        patch.object(
+            worker,
+            "SessionLocal",
+            side_effect=failed_sessions,
+        ) as session_factory,
+        patch.object(
+            worker.asyncio, "sleep", new_callable=AsyncMock
+        ) as sleep_mock,
+    ):
+        with pytest.raises(
+            RuntimeError, match="database unavailable"
+        ):
+            await worker.process_event_batch(payloads)
+
+    assert session_factory.call_count == worker.DB_MAX_RETRIES
+    assert sleep_mock.await_count == worker.DB_MAX_RETRIES - 1
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_does_not_mark_records_complete():
+    queue = asyncio.Queue()
+    tracker = MagicMock()
+    tracker.mark_completed = AsyncMock()
+
+    items = [
+        worker.PendingRecord(
+            topic_partition=worker.TopicPartition(
+                "dislog-events", 0
+            ),
+            offset=100 + i,
+            payload=valid_payload(),
+        )
+        for i in range(3)
+    ]
+
+    for item in items:
+        await queue.put(item)
+
+    with patch.object(
+        worker,
+        "process_event_batch",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("database unavailable"),
+    ):
+        with pytest.raises(
+            RuntimeError, match="database unavailable"
+        ):
+            await worker.persistence_worker(
+                queue,
+                worker_id=1,
+                offset_tracker=tracker,
+            )
+
+    tracker.mark_completed.assert_not_awaited()
+    assert all(item.completed is False for item in items)
+    await asyncio.wait_for(queue.join(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_partial_batch_is_processed_without_waiting_for_full_batch():
+    queue = worker.create_work_queue()
+    items = [
+        worker.PendingRecord(
+            topic_partition=worker.TopicPartition("dislog-events", 0),
+            offset=300 + i,
+            payload=valid_payload(),
+        )
+        for i in range(3)
+    ]
+
+    for item in items:
+        await queue.put(item)
+
+    with patch.object(
+        worker,
+        "process_event_batch",
+        new_callable=AsyncMock,
+    ) as persist_batch:
+        task = asyncio.create_task(
+            worker.persistence_worker(queue, worker_id=1)
+        )
+
+        try:
+            await asyncio.wait_for(queue.join(), timeout=3)
+        finally:
+            await queue.put(None)
+            await asyncio.wait_for(task, timeout=3)
+
+    persist_batch.assert_awaited_once_with(
+        [item.payload for item in items]
+    )
+    assert all(item.completed for item in items)
+    assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_dlq_failure_does_not_mark_invalid_record_complete():
+    queue = worker.create_work_queue()
+    item = worker.PendingRecord(
+        topic_partition=worker.TopicPartition("dislog-events", 0),
+        offset=400,
+        payload={"invalid": "event"},
+    )
+    await queue.put(item)
+
+    dead_letter_producer = AsyncMock()
+    dead_letter_producer.send_and_wait.side_effect = RuntimeError(
+        "DLQ unavailable"
+    )
+    tracker = MagicMock()
+    tracker.mark_completed = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="DLQ unavailable"):
+        await worker.persistence_worker(
+            queue,
+            worker_id=1,
+            dead_letter_producer=dead_letter_producer,
+            offset_tracker=tracker,
+        )
+
+    dead_letter_producer.send_and_wait.assert_awaited_once()
+    tracker.mark_completed.assert_not_awaited()
+    assert item.completed is False
+    await asyncio.wait_for(queue.join(), timeout=2)
