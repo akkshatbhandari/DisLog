@@ -13,4 +13,4 @@ Stage 5: Offset tracking and Bounded work queue
 
 Stage 6: Retries, failure handling
 
-Stage 7: Batch processing of event streams by consumers
+Stage 7: Batch processing of event streams by consumers for persistence
