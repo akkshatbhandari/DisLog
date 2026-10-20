@@ -130,7 +130,6 @@ class OffsetTracker:
             if not records:
                 del self.pending[item.topic_partition]
 
-
 def create_work_queue() -> asyncio.Queue:
     """Create a bounded queue using centralized configuration"""
     return asyncio.Queue(maxsize = QUEUE_MAX_SIZE)
@@ -149,7 +148,6 @@ def deserialize_event(value: bytes) -> dict:
         raise ValueError("Event payload must be a JSON object")
 
     return payload
-
 
 def validate_event(payload: dict) -> UUID:
     """Validate the fields required for persistence"""
@@ -176,7 +174,7 @@ def validate_event(payload: dict) -> UUID:
 
 
 async def process_event(payload: dict) -> None:
-    """Persist one kafka event to postgresql idempotently"""
+    """Persist one kafka event to postgresql idempotently."""
     event_id = validate_event(payload)
 
     statement = (
@@ -227,6 +225,7 @@ async def process_event(payload: dict) -> None:
                 delay,
             )
             await asyncio.sleep(delay)
+
 
 async def process_event_batch(payloads: list[dict]) -> None:
     """Persist multiple events in one idempotent PostgreSQL transaction."""
@@ -448,6 +447,24 @@ async def persistence_worker(
                 queue.task_done()
 
 
+def _check_worker_tasks(tasks: list[asyncio.Task]) -> None:
+    """Worker failures take precedence over a shutdown request."""
+    for task in tasks:
+        if task.done():
+            if task.cancelled():
+                raise RuntimeError(
+                    f"Persistence worker was cancelled: {task.get_name()}"
+                )
+
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+
+            raise RuntimeError(
+                f"Persistence worker exited unexpectedly: {task.get_name()}"
+            )
+
+
 async def supervise_workers(
     queue: asyncio.Queue,
     dead_letter_producer,
@@ -480,21 +497,7 @@ async def supervise_workers(
             return_when = asyncio.FIRST_COMPLETED,
         )
 
-        # Worker failures take precedence over a shutdown request.
-        for task in tasks:
-            if task.done():
-                if task.cancelled():
-                    raise RuntimeError(
-                        f"Persistence worker was cancelled: {task.get_name()}"
-                    )
-
-                exception = task.exception()
-                if exception is not None:
-                    raise exception
-                
-                raise RuntimeError(
-                    f"Persistence worker exited unexpectedly: {task.get_name()}"
-                )
+        _check_worker_tasks(tasks)
         
         if shutdown_waiter not in done:
             raise RuntimeError("Worker pool stopped unexpectedly")
@@ -509,21 +512,7 @@ async def supervise_workers(
                 return_when = asyncio.FIRST_COMPLETED,
             )
 
-            for task in tasks:
-                if task.done():
-                    if task.cancelled():
-                        raise RuntimeError(
-                            f"Persistence worker was cancelled: {task.get_name()}"
-                        )
-                    
-                    exception = task.exception()
-
-                    if exception is not None:
-                        raise exception
-                    
-                    raise RuntimeError(
-                        f"Persistence worker exited unexpectedly: {task.get_name()}"
-                    )
+            _check_worker_tasks(tasks)
 
             if join_task not in done:
                 raise RuntimeError("Worker exited before the queue drained")
@@ -558,6 +547,8 @@ async def supervise_workers(
         
         await asyncio.gather(*tasks, return_exceptions=True)
 
+#entry point
+#top-level orchestration engine and lifecycle manager
 async def run_worker() -> None:
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
@@ -616,12 +607,6 @@ async def run_worker() -> None:
         consumer_started = True
 
         logger.info("Kafka peristence worker started")
-
-        # logger.info(
-        #     "DisLog persistence worker started topic=%s workers=%s",
-        #     KAFKA_TOPIC,
-        #     WORKER_COUNT,
-        # )
 
         worker_supervisor = asyncio.create_task(
             supervise_workers(

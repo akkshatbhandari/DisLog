@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(ENV_FILE)
 
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
 
 def positive_int(name: str, default:int) -> int:
     """Read an environment variable as a positive int"""

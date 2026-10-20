@@ -1,7 +1,8 @@
+import argparse
 import asyncio
 import json
-import time
 import statistics
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -13,13 +14,43 @@ from app.database import SessionLocal
 from app.models import Event
 
 
-GATEWAY_URL = "http://127.0.0.1:3000/api/v1/events"
-BATCH_SIZE = 500
-CONCURRENCY = 25
-PERSISTENCE_TIMEOUT = 60
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(
+        description="DisLog gateway end-to-end load test"
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=500,
+        help="Number of events to send (default: 500)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=25,
+        help="HTTP concurrency / thread count (default: 25)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="Timeout in seconds for persistence verification (default: 60)",
+    )
+    parser.add_argument(
+        "--gateway-url",
+        type=str,
+        default="http://127.0.0.1:3000/api/v1/events",
+        help="Gateway events URL",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Keep persisted records in the database (diagnostic mode)",
+    )
+    return parser.parse_args(args)
 
 
-def post_event(index, run_id):
+def post_event(index, run_id, gateway_url):
     payload = {
         "service": "dislog-load-test",
         "level": "INFO",
@@ -31,7 +62,7 @@ def post_event(index, run_id):
     }
 
     request = Request(
-        GATEWAY_URL,
+        gateway_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -82,17 +113,20 @@ def post_event(index, run_id):
     }
 
 
-def run_batch(run_id):
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+def run_batch(run_id, count, concurrency, gateway_url):
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
         return list(
             executor.map(
-                lambda index: post_event(index, run_id),
-                range(BATCH_SIZE),
+                lambda index: post_event(index, run_id, gateway_url),
+                range(count),
             )
         )
 
 
-async def main():
+async def main(args=None):
+    if args is None:
+        args = parse_args()
+
     run_id = str(uuid4())
     accepted_ids = set()
     results = []
@@ -103,10 +137,12 @@ async def main():
 
     try:
         print(f"Run ID: {run_id}")
-        print(f"Sending {BATCH_SIZE} events via {GATEWAY_URL}")
-        print(f"HTTP concurrency: {CONCURRENCY}")
+        print(f"Sending {args.count} events via {args.gateway_url}")
+        print(f"HTTP concurrency: {args.concurrency}")
 
-        results = await asyncio.to_thread(run_batch, run_id)
+        results = await asyncio.to_thread(
+            run_batch, run_id, args.count, args.concurrency, args.gateway_url
+        )
 
         batch_finished = time.perf_counter()
 
@@ -131,7 +167,7 @@ async def main():
         print(f"Requests attempted: {len(results)}")
         print(f"Successful HTTP responses: {successful_http}")
         print(f"Responses with usable event IDs: {len(accepted_ids)}")
-        print(f"Acceptance rate: {successful_http / BATCH_SIZE * 100:.2f}%")
+        print(f"Acceptance rate: {successful_http / args.count * 100:.2f}%")
         print(f"HTTP batch duration: {batch_finished - batch_started:.3f}s")
         print(f"Mean request latency: {statistics.mean(latencies) * 1000:.1f} ms")
         print(f"Median request latency: {statistics.median(latencies) * 1000:.1f} ms")
@@ -153,9 +189,8 @@ async def main():
             return
 
         # Poll PostgreSQL through the SQLAlchemy async engine.
-        # Keep all database operations in this one event loop.
         persistence_started = time.perf_counter()
-        deadline = persistence_started + PERSISTENCE_TIMEOUT
+        deadline = persistence_started + args.timeout
         uuid_ids = [UUID(event_id) for event_id in accepted_ids]
 
         while True:
@@ -196,9 +231,9 @@ async def main():
                 print(f"  {event_id}")
 
         if (
-            len(results) == BATCH_SIZE
-            and successful_http == BATCH_SIZE
-            and len(accepted_ids) == BATCH_SIZE
+            len(results) == args.count
+            and successful_http == args.count
+            and len(accepted_ids) == args.count
             and not missing_ids
         ):
             print("\nRESULT: PASS — all events were accepted and persisted.")
@@ -206,8 +241,7 @@ async def main():
             print("\nRESULT: FAIL — investigate HTTP errors or missing records.")
 
     finally:
-        # Delete only events whose IDs this test received from the API.
-        if accepted_ids:
+        if accepted_ids and not args.no_cleanup:
             async with SessionLocal() as session:
                 await session.execute(
                     delete(Event).where(
@@ -217,6 +251,8 @@ async def main():
                 await session.commit()
 
             print(f"\nCleaned up {len(accepted_ids)} test event IDs.")
+        elif accepted_ids and args.no_cleanup:
+            print(f"\nDiagnostic mode: preserved {len(accepted_ids)} records in database.")
 
         await SessionLocal.kw["bind"].dispose()
 
